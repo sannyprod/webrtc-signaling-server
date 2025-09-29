@@ -12,6 +12,10 @@ class WebRTCApp {
         this.peers = new Map();
         this.currentRoom = null;
 
+        this.pendingOffers = new Map();
+        this.pendingAnswers = new Map();
+        this.peerStates = new Map();
+
         this.initializeElements();
         this.initializeSocket();
         this.setupEventListeners();
@@ -174,7 +178,12 @@ class WebRTCApp {
     }
 
     createPeer(userId, isInitiator) {
-        if (this.peers.has(userId)) return;
+        if (this.peers.has(userId)) {
+            console.log('Peer already exists for:', userId);
+            return;
+        }
+
+        console.log(`Creating peer for ${userId}, initiator: ${isInitiator}`);
 
         const peer = new SimplePeer({
             initiator: isInitiator,
@@ -188,7 +197,11 @@ class WebRTCApp {
             }
         });
 
+        // Добавь состояние пира
+        this.peerStates.set(userId, 'stable');
+
         peer.on('signal', (data) => {
+            console.log(`Signal from ${userId}:`, data.type);
             this.handleSignal(data, userId);
         });
 
@@ -201,6 +214,7 @@ class WebRTCApp {
         peer.on('connect', () => {
             console.log('WebRTC connected to:', userId);
             this.updateStatus(`Connected to ${userId.substring(0, 8)}`, true);
+            this.peerStates.set(userId, 'stable');
         });
 
         peer.on('close', () => {
@@ -214,46 +228,94 @@ class WebRTCApp {
         });
 
         this.peers.set(userId, peer);
+
+        setTimeout(() => {
+            this.processPendingSignals(userId);
+        }, 200);
     }
 
     handleSignal(data, targetUserId) {
+        console.log(`Sending ${data.type} to ${targetUserId}`);
+
+        // Обновляем состояние на основе типа сигнала
         if (data.type === 'offer') {
-            this.socket.emit('offer', {
-                target: targetUserId,
-                offer: data
-            });
+            this.peerStates.set(targetUserId, 'have-local-offer');
         } else if (data.type === 'answer') {
-            this.socket.emit('answer', {
-                target: targetUserId,
-                answer: data
-            });
-        } else if (data.type === 'candidate') {
-            this.socket.emit('ice-candidate', {
-                target: targetUserId,
-                candidate: data
-            });
+            this.peerStates.set(targetUserId, 'stable');
         }
+
+        // Проверяем pending answers/offers при отправке сигнала
+        if (data.type === 'offer' && this.pendingAnswers.has(targetUserId)) {
+            console.log('Found pending answer, processing...');
+            const pendingAnswer = this.pendingAnswers.get(targetUserId);
+            setTimeout(() => {
+                this.handleAnswer({ sender: targetUserId, answer: pendingAnswer });
+            }, 200);
+            this.pendingAnswers.delete(targetUserId);
+        }
+
+        this.socket.emit(data.type, {
+            target: targetUserId,
+            [data.type]: data
+        });
     }
 
+
     async handleOffer(data) {
+        console.log('Handling offer from:', data.sender);
+
+        // Если пир уже существует, уничтожим его
+        if (this.peers.has(data.sender)) {
+            console.log('Peer already exists, destroying old one');
+            this.removePeer(data.sender);
+        }
+
         if (!this.localStream) {
             const mediaSuccess = await this.initializeMedia();
             if (!mediaSuccess) return;
         }
 
+        // Создаем пир как ответчик (initiator: false)
         this.createPeer(data.sender, false);
-        const peer = this.peers.get(data.sender);
-        if (peer) {
-            peer.signal(data.offer);
-        }
+
+        // Даем время на инициализацию пира
+        setTimeout(() => {
+            const peer = this.peers.get(data.sender);
+            if (peer && this.peerStates.get(data.sender) === 'stable') {
+                console.log('Signaling offer to peer');
+                this.peerStates.set(data.sender, 'have-remote-offer');
+                peer.signal(data.offer);
+            } else {
+                console.warn('Peer not ready for offer');
+                // Сохраняем оффер для последующей обработки
+                this.pendingOffers.set(data.sender, data.offer);
+            }
+        }, 100);
     }
 
     async handleAnswer(data) {
+        console.log('Handling answer from:', data.sender);
+
         const peer = this.peers.get(data.sender);
         if (peer) {
-            peer.signal(data.answer);
+            const currentState = this.peerStates.get(data.sender);
+            console.log('Current peer state:', currentState);
+
+            if (currentState === 'have-local-offer') {
+                console.log('Signaling answer to peer');
+                this.peerStates.set(data.sender, 'stable');
+                peer.signal(data.answer);
+            } else {
+                console.warn('Wrong state for answer:', currentState);
+                // Сохраняем ответ для последующей обработки
+                this.pendingAnswers.set(data.sender, data.answer);
+            }
+        } else {
+            console.warn('No peer found for answer from:', data.sender);
+            this.pendingAnswers.set(data.sender, data.answer);
         }
     }
+
 
     handleIceCandidate(data) {
         const peer = this.peers.get(data.sender);
@@ -263,18 +325,22 @@ class WebRTCApp {
     }
 
     removePeer(userId) {
+        console.log('Removing peer:', userId);
+
         const peer = this.peers.get(userId);
         if (peer) {
             peer.destroy();
-            this.peers.delete(userId);
         }
+
+        this.peers.delete(userId);
+        this.peerStates.delete(userId);
+        this.pendingOffers.delete(userId);
+        this.pendingAnswers.delete(userId);
 
         if (this.peers.size === 0) {
             this.remoteVideo.srcObject = null;
-            // Показываем видео элемент обратно если он был скрыт
             this.remoteVideo.style.display = 'block';
         }
-
     }
 
     async shareScreen() {
@@ -386,6 +452,32 @@ class WebRTCApp {
             }, 5000);
         }
     }
+
+    processPendingSignals(userId) {
+        const peer = this.peers.get(userId);
+        if (!peer) return;
+
+        // Обработка pending offer
+        if (this.pendingOffers.has(userId)) {
+            const pendingOffer = this.pendingOffers.get(userId);
+            console.log('Processing pending offer for:', userId);
+            this.peerStates.set(userId, 'have-remote-offer');
+            peer.signal(pendingOffer);
+            this.pendingOffers.delete(userId);
+        }
+
+        // Обработка pending answer
+        if (this.pendingAnswers.has(userId)) {
+            const pendingAnswer = this.pendingAnswers.get(userId);
+            console.log('Processing pending answer for:', userId);
+            if (this.peerStates.get(userId) === 'have-local-offer') {
+                this.peerStates.set(userId, 'stable');
+                peer.signal(pendingAnswer);
+                this.pendingAnswers.delete(userId);
+            }
+        }
+    }
+
 }
 
 // Инициализация приложения
