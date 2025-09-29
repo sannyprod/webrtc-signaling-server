@@ -1,161 +1,113 @@
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
+const path = require('path');
 const cors = require('cors');
 
 const app = express();
 const server = http.createServer(app);
 
-// Настройки CORS для Railway
-app.use(cors({
-  origin: "*",
-  methods: ["GET", "POST"]
-}));
-
-// Инициализация Socket.io
+// Настройки для production
 const io = socketIo(server, {
   cors: {
-    origin: "*",
-    methods: ["GET", "POST"]
-  }
+    origin: process.env.NODE_ENV === 'production' 
+      ? ["https://webrtc-signaling-server-production-f6b7.up.railway.app"] 
+      : ["http://localhost:3000", "http://127.0.0.1:3000"],
+    methods: ["GET", "POST"],
+    credentials: true
+  },
+  transports: ['websocket', 'polling']
 });
 
-// Хранилище комнат
+// Middleware
+app.use(cors());
+app.use(express.json());
+app.use(express.static(path.join(__dirname, './public')));
+
+// Health check endpoint для Railway
+app.get('/health', (req, res) => {
+  res.status(200).json({ 
+    status: 'OK', 
+    timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV || 'development'
+  });
+});
+
+// Хранилище пользователей и комнат
 const rooms = new Map();
 
-// Статическая страница для теста
-app.get('/', (req, res) => {
-  res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <title>WebRTC Signaling Server</title>
-    </head>
-    <body>
-      <h1>🚀 WebRTC Signaling Server is Running!</h1>
-      <p>Connected users: <span id="users">0</span></p>
-      <p>Active rooms: <span id="rooms">0</span></p>
-      
-      <script src="/socket.io/socket.io.js"></script>
-      <script>
-        const socket = io();
-        socket.on('stats-update', (data) => {
-          document.getElementById('users').textContent = data.users;
-          document.getElementById('rooms').textContent = data.rooms;
-        });
-      </script>
-    </body>
-    </html>
-  `);
-});
-
-// Socket.io обработчики
 io.on('connection', (socket) => {
-  console.log('✅ User connected:', socket.id);
+  console.log('User connected:', socket.id);
   
-  // Отправляем текущую статистику
-  updateStats();
-  
-  // Создание комнаты
-  socket.on('create-room', (roomId) => {
-    rooms.set(roomId, {
-      users: [socket.id],
-      createdAt: new Date().toISOString()
-    });
+  socket.on('join-room', (roomId) => {
+    // Покидаем предыдущую комнату если есть
+    if (socket.roomId) {
+      socket.leave(socket.roomId);
+    }
     
     socket.join(roomId);
-    socket.emit('room-created', roomId);
+    socket.roomId = roomId;
     
-    console.log(`🆕 Room created: ${roomId}`);
-    updateStats();
-  });
-  
-  // Присоединение к комнате
-  socket.on('join-room', (roomId) => {
-    const room = rooms.get(roomId);
-    
-    if (room) {
-      room.users.push(socket.id);
-      socket.join(roomId);
-      
-      // Уведомляем существующих пользователей
-      socket.to(roomId).emit('user-joined', {
-        userId: socket.id,
-        roomId: roomId
-      });
-      
-      socket.emit('room-joined', {
-        roomId: roomId,
-        users: room.users.filter(id => id !== socket.id)
-      });
-      
-      console.log(`👥 User ${socket.id} joined room: ${roomId}`);
-      updateStats();
-    } else {
-      socket.emit('room-not-found', roomId);
+    // Инициализируем комнату если не существует
+    if (!rooms.has(roomId)) {
+      rooms.set(roomId, new Set());
     }
+    
+    rooms.get(roomId).add(socket.id);
+    
+    // Уведомляем других участников комнаты
+    socket.to(roomId).emit('user-connected', socket.id);
+    
+    // Отправляем список текущих пользователей в комнате
+    const usersInRoom = Array.from(rooms.get(roomId) || []);
+    socket.emit('room-users', usersInRoom);
+    
+    console.log(`User ${socket.id} joined room ${roomId}`);
   });
   
-  // WebRTC сигналы
-  socket.on('webrtc-offer', (data) => {
-    socket.to(data.target).emit('webrtc-offer', {
+  // WebRTC signaling
+  socket.on('offer', (data) => {
+    socket.to(data.target).emit('offer', {
       offer: data.offer,
-      from: socket.id
+      sender: socket.id
     });
   });
   
-  socket.on('webrtc-answer', (data) => {
-    socket.to(data.target).emit('webrtc-answer', {
+  socket.on('answer', (data) => {
+    socket.to(data.target).emit('answer', {
       answer: data.answer,
-      from: socket.id
+      sender: socket.id
     });
   });
   
-  socket.on('webrtc-ice-candidate', (data) => {
-    socket.to(data.target).emit('webrtc-ice-candidate', {
+  socket.on('ice-candidate', (data) => {
+    socket.to(data.target).emit('ice-candidate', {
       candidate: data.candidate,
-      from: socket.id
+      sender: socket.id
     });
   });
   
-  // Отключение
   socket.on('disconnect', () => {
-    console.log('❌ User disconnected:', socket.id);
+    console.log('User disconnected:', socket.id);
     
-    // Удаляем пользователя из всех комнат
-    rooms.forEach((room, roomId) => {
-      const userIndex = room.users.indexOf(socket.id);
-      if (userIndex > -1) {
-        room.users.splice(userIndex, 1);
-        
-        // Уведомляем остальных
-        socket.to(roomId).emit('user-left', socket.id);
-        
-        // Удаляем пустые комнаты
-        if (room.users.length === 0) {
-          rooms.delete(roomId);
-          console.log(`🗑️ Room deleted: ${roomId}`);
-        }
+    if (socket.roomId && rooms.has(socket.roomId)) {
+      rooms.get(socket.roomId).delete(socket.id);
+      
+      // Удаляем комнату если пустая
+      if (rooms.get(socket.roomId).size === 0) {
+        rooms.delete(socket.roomId);
+      } else {
+        // Уведомляем других участников
+        socket.to(socket.roomId).emit('user-disconnected', socket.id);
       }
-    });
-    
-    updateStats();
+    }
   });
 });
 
-// Функция обновления статистики
-function updateStats() {
-  const stats = {
-    users: io.engine.clientsCount,
-    rooms: rooms.size
-  };
-  
-  io.emit('stats-update', stats);
-}
-
-// Запуск сервера
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`🎯 Signaling server running on port ${PORT}`);
-  console.log(`🔗 Local: http://localhost:${PORT}`);
+const HOST = process.env.HOST || '0.0.0.0';
+
+server.listen(PORT, HOST, () => {
+  console.log(`Server running on ${HOST}:${PORT}`);
+  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
 });
