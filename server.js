@@ -1,6 +1,7 @@
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
+const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
@@ -10,6 +11,9 @@ const io = socketIo(server, {
     methods: ["GET", "POST"]
   }
 });
+
+// Serve static files for demo (optional)
+app.use(express.static(path.join(__dirname, 'public')));
 
 // Store connected users
 const users = new Map();
@@ -24,19 +28,22 @@ io.on('connection', (socket) => {
       name: userData.name || `User-${socket.id.substring(0, 6)}`,
       ...userData
     };
-
+    
     users.set(socket.id, userInfo);
     console.log(`User registered: ${userInfo.name} (${socket.id})`);
-
+    
     // Notify others about new user
     socket.broadcast.emit('user-joined', userInfo);
-
+    
     // Send list of existing users to the new user
     const userList = Array.from(users.values()).filter(user => user.id !== socket.id);
     socket.emit('users-list', userList);
-
+    
     // Confirm registration
-    socket.emit('registered', { id: socket.id, users: userList });
+    socket.emit('registered', { 
+      id: socket.id, 
+      users: userList 
+    });
   });
 
   // WebRTC Offer
@@ -48,9 +55,10 @@ io.on('connection', (socket) => {
         from: socket.id,
         fromName: users.get(socket.id)?.name
       });
+    } else {
+      console.log(`Target user ${data.target} not found`);
     }
   });
-
 
   // WebRTC Answer
   socket.on('answer', (data) => {
@@ -60,48 +68,51 @@ io.on('connection', (socket) => {
         answer: data.answer,
         from: socket.id
       });
+    } else {
+      console.log(`Target user ${data.target} not found`);
     }
   });
 
-  socket.on('call-accepted', (data) => {
-    console.log(`Call accepted by ${socket.id} from ${data.target}`);
-    // Можно отправить подтверждение вызывающему
-    socket.to(data.target).emit('call-accepted', {
-      from: socket.id
-    });
-  });
-
-
   // ICE Candidates
   socket.on('ice-candidate', (data) => {
+    console.log(`ICE candidate from ${socket.id} to ${data.target}`);
     if (users.has(data.target)) {
       socket.to(data.target).emit('ice-candidate', {
         candidate: data.candidate,
         from: socket.id
       });
+    } else {
+      console.log(`Target user ${data.target} not found`);
     }
   });
 
   // Call initiation
   socket.on('call-user', (data) => {
-    console.log(`Call from ${socket.id} to ${data.target}`);
+    console.log(`Call request from ${socket.id} to ${data.target}`);
     if (users.has(data.target)) {
       socket.to(data.target).emit('incoming-call', {
         from: socket.id,
         fromName: users.get(socket.id)?.name
       });
+    } else {
+      console.log(`Target user ${data.target} not found`);
+      socket.emit('call-rejected', { from: data.target });
     }
   });
 
-  socket.on('end-call', (data) => {
+  // Call acceptance
+  socket.on('call-accepted', (data) => {
+    console.log(`Call accepted by ${socket.id} from ${data.target}`);
     if (users.has(data.target)) {
-      socket.to(data.target).emit('call-ended', {
+      socket.to(data.target).emit('call-accepted', {
         from: socket.id
       });
     }
   });
 
+  // Call rejection
   socket.on('reject-call', (data) => {
+    console.log(`Call rejected by ${socket.id} from ${data.target}`);
     if (users.has(data.target)) {
       socket.to(data.target).emit('call-rejected', {
         from: socket.id
@@ -109,11 +120,20 @@ io.on('connection', (socket) => {
     }
   });
 
+  // End call
+  socket.on('end-call', (data) => {
+    console.log(`Call ended by ${socket.id} with ${data.target}`);
+    if (users.has(data.target)) {
+      socket.to(data.target).emit('call-ended', {
+        from: socket.id
+      });
+    }
+  });
 
   // Handle user disconnection
   socket.on('disconnect', (reason) => {
     console.log('User disconnected:', socket.id, 'Reason:', reason);
-
+    
     const userInfo = users.get(socket.id);
     if (userInfo) {
       users.delete(socket.id);
@@ -121,6 +141,7 @@ io.on('connection', (socket) => {
         id: socket.id,
         name: userInfo.name
       });
+      console.log(`User ${userInfo.name} removed from users list`);
     }
   });
 
@@ -128,12 +149,18 @@ io.on('connection', (socket) => {
   socket.on('ping', () => {
     socket.emit('pong');
   });
+
+  // Error handling
+  socket.on('error', (error) => {
+    console.error('Socket error:', error);
+  });
 });
 
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
+    timestamp: new Date().toISOString(),
     usersCount: users.size,
     users: Array.from(users.values()).map(user => ({
       id: user.id,
@@ -142,8 +169,28 @@ app.get('/health', (req, res) => {
   });
 });
 
+// Root endpoint
+app.get('/', (req, res) => {
+  res.json({
+    message: 'WebRTC Signaling Server',
+    status: 'running',
+    endpoints: {
+      health: '/health',
+      websocket: '/socket.io/'
+    }
+  });
+});
+
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`WebRTC Signaling Server running on port ${PORT}`);
-  console.log(`Health check available at: http://localhost:${PORT}/health`);
+  console.log(`🚀 WebRTC Signaling Server running on port ${PORT}`);
+  console.log(`📍 Health check: http://localhost:${PORT}/health`);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received, shutting down gracefully');
+  server.close(() => {
+    console.log('Process terminated');
+  });
 });
