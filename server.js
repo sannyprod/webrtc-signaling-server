@@ -24,17 +24,17 @@ io.on('connection', (socket) => {
       name: userData.name || `User-${socket.id.substring(0, 6)}`,
       ...userData
     };
-    
+
     users.set(socket.id, userInfo);
     console.log(`User registered: ${userInfo.name} (${socket.id})`);
-    
+
     // Notify others about new user
     socket.broadcast.emit('user-joined', userInfo);
-    
+
     // Send list of existing users to the new user
     const userList = Array.from(users.values()).filter(user => user.id !== socket.id);
     socket.emit('users-list', userList);
-    
+
     // Confirm registration
     socket.emit('registered', { id: socket.id, users: userList });
   });
@@ -74,7 +74,7 @@ io.on('connection', (socket) => {
 
   // Call initiation
   socket.on('call-user', (data) => {
-    console.log(`Call request from ${socket.id} to ${data.target}`);
+    console.log(`Call from ${socket.id} to ${data.target}`);
     if (users.has(data.target)) {
       socket.to(data.target).emit('incoming-call', {
         from: socket.id,
@@ -83,16 +83,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Call rejection
-  socket.on('reject-call', (data) => {
-    if (users.has(data.target)) {
-      socket.to(data.target).emit('call-rejected', {
-        from: socket.id
-      });
-    }
-  });
-
-  // End call
   socket.on('end-call', (data) => {
     if (users.has(data.target)) {
       socket.to(data.target).emit('call-ended', {
@@ -101,10 +91,19 @@ io.on('connection', (socket) => {
     }
   });
 
+  socket.on('reject-call', (data) => {
+    if (users.has(data.target)) {
+      socket.to(data.target).emit('call-rejected', {
+        from: socket.id
+      });
+    }
+  });
+
+
   // Handle user disconnection
   socket.on('disconnect', (reason) => {
     console.log('User disconnected:', socket.id, 'Reason:', reason);
-    
+
     const userInfo = users.get(socket.id);
     if (userInfo) {
       users.delete(socket.id);
