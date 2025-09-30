@@ -51,6 +51,7 @@ io.on('connection', (socket) => {
     }
   });
 
+
   // WebRTC Answer
   socket.on('answer', (data) => {
     console.log(`Answer from ${socket.id} to ${data.target}`);
@@ -61,6 +62,15 @@ io.on('connection', (socket) => {
       });
     }
   });
+
+  socket.on('call-accepted', (data) => {
+    console.log(`Call accepted by ${socket.id} from ${data.target}`);
+    // Можно отправить подтверждение вызывающему
+    socket.to(data.target).emit('call-accepted', {
+      from: socket.id
+    });
+  });
+
 
   // ICE Candidates
   socket.on('ice-candidate', (data) => {
